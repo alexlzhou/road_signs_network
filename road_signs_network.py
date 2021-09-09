@@ -198,14 +198,13 @@ def show_corner_bb(im, bb):
 
 
 # original
-print(df_train.values[68])
 im = cv2.imread(str(df_train.values[68][8]))
 im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-show_corner_bb(im, df_train.values[68][9])
+# show_corner_bb(im, df_train.values[68][9])
 
 # flipped
 im, bb = transformsXY(str(df_train.values[68][8]), df_train.values[68][9], True)
-show_corner_bb(im, bb)
+# show_corner_bb(im, bb)
 
 """
 --------------------
@@ -247,7 +246,7 @@ class RoadDataset(Dataset):
 train_ds = RoadDataset(X_train['new_path'], X_train['new_bb'], Y_train, transforms=True)
 valid_ds = RoadDataset(X_val['new_path'], X_val['new_bb'], Y_val)
 
-batch_size = 64
+batch_size = 8
 train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 valid_dl = DataLoader(valid_ds, batch_size=batch_size)
 
@@ -340,3 +339,31 @@ train_epocs(model, optimizer, train_dl, valid_dl, epochs=15)
 
 update_optimizer(optimizer, 0.001)
 train_epocs(model, optimizer, train_dl, valid_dl, epochs=10)
+
+pd.set_option('display.max_rows', 20, 'display.max_columns', None)
+print(X_val)
+
+# resizing test image
+im = read_image('D:/projects_python/road_signs_network/road_signs/images_resized/road789.png')
+im = cv2.resize(im, (int(1.49 * 300), 300))
+cv2.imwrite('D:/projects_python/road_signs_network/road_signs/road_signs_test/road789.jpg',
+            cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
+
+# test Dataset
+test_ds = RoadDataset(
+    pd.DataFrame([{'path': 'D:/projects_python/road_signs_network/road_signs/road_signs_test/road789.jpg'}])['path'],
+    pd.DataFrame([{'bb': np.array([0, 0, 0, 0])}])['bb'], pd.DataFrame([{'y': [0]}])['y'])
+x, y_class, y_bb = test_ds[0]
+
+xx = torch.FloatTensor(x[None,])
+print(xx.shape)
+
+out_class, out_bb = model(xx.cuda())
+print(out_class, out_bb)
+
+print(torch.max(out_class, 1))
+
+# predicted bounding box
+bb_hat = out_bb.detach().cpu().numpy()
+bb_hat = bb_hat.astype(int)
+show_corner_bb(im, bb_hat[0])
