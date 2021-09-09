@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 
 images_path = Path('D:/projects_python/road_signs_network/road_signs/images')
-anno_path = Path('./road_signs/annotations')
+anno_path = Path('D:/projects_python/road_signs_network/road_signs/annotations')
 
 
 def file_list(root, file_type):
@@ -54,8 +54,9 @@ df_train = generate_train_df(anno_path)
 class_dict = {'speedlimit': 0, 'stop': 1, 'crosswalk': 2, 'trafficlight': 3}
 df_train['class'] = df_train['class'].apply(lambda x: class_dict[x])
 
-print(df_train.shape)
-print(df_train.head())
+
+# print(df_train.shape)
+# print(df_train.head())
 
 
 def read_image(path):
@@ -98,9 +99,10 @@ def resize_image_bb(read_path, write_path, bb, sz):
     return new_path, mask_to_bb(Y_resized)
 
 
+# populate df_train with new paths and bounding boxes
 new_paths = []
 new_bbs = []
-train_path_resized = Path('./road_signs/images_resized')
+train_path_resized = Path('D:/projects_python/road_signs_network/road_signs/images_resized')
 for index, row in df_train.iterrows():
     new_path, new_bb = resize_image_bb(row['filename'], train_path_resized, create_bb_array(row.values), 300)
     new_paths.append(new_path)
@@ -112,13 +114,15 @@ im = cv2.imread(str(df_train.values[58][0]))
 bb = create_bb_array(df_train.values[58])
 
 Y = create_mask(bb, im)
-mask_to_bb(Y)
+Y = mask_to_bb(Y)
 
+"""
 plt.imshow(im)
 plt.show()
 
 plt.imshow(Y, cmap='gray')
 plt.show()
+"""
 
 
 def crop(im, r, c, target_r, target_c):
@@ -190,10 +194,149 @@ def create_corner_rect(bb, color='red'):
 def show_corner_bb(im, bb):
     plt.imshow(im)
     plt.gca().add_patch(create_corner_rect(bb))
+    plt.show()
 
 
 # original
-print(str(df_train.values[68][8]))
+print(df_train.values[68])
 im = cv2.imread(str(df_train.values[68][8]))
 im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
 show_corner_bb(im, df_train.values[68][9])
+
+# flipped
+im, bb = transformsXY(str(df_train.values[68][8]), df_train.values[68][9], True)
+show_corner_bb(im, bb)
+
+"""
+--------------------
+TRAIN-VALID SPLIT
+--------------------
+"""
+df_train = df_train.reset_index()
+X = df_train[['new_path', 'new_bb']]
+Y = df_train['class']
+
+X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.2, random_state=42)
+
+
+def normalize(im):
+    """normalizes images with Imagenet stats."""
+    imagenet_stats = np.array([[0.485, 0.456, 0.406], [0.229, 0.224, 0.225]])
+    return (im - imagenet_stats[0]) / imagenet_stats[1]
+
+
+class RoadDataset(Dataset):
+    def __init__(self, paths, bb, y, transforms=False):
+        self.transforms = transforms
+        self.paths = paths.values
+        self.bb = bb.values
+        self.y = y.values
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        y_class = self.y[idx]
+        x, y_bb = transformsXY(path, self.bb[idx], self.transforms)
+        x = normalize(x)
+        x = np.rollaxis(x, 2)
+        return x, y_class, y_bb
+
+
+train_ds = RoadDataset(X_train['new_path'], X_train['new_bb'], Y_train, transforms=True)
+valid_ds = RoadDataset(X_val['new_path'], X_val['new_bb'], Y_val)
+
+batch_size = 64
+train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+valid_dl = DataLoader(valid_ds, batch_size=batch_size)
+
+"""
+--------------------
+MODEL
+--------------------
+"""
+
+
+class BB_model(nn.Module):
+    def __init__(self):
+        super(BB_model, self).__init__()
+        resnet = models.resnet34(pretrained=True)
+        layers = list(resnet.children())[:8]
+        self.features1 = nn.Sequential(*layers[:6])
+        self.features2 = nn.Sequential(*layers[6:])
+        self.classifier = nn.Sequential(nn.BatchNorm1d(512), nn.Linear(512, 4))
+        self.bb = nn.Sequential(nn.BatchNorm1d(512), nn.Linear(512, 4))
+
+    def forward(self, x):
+        x = self.features1(x)
+        x = self.features2(x)
+        x = F.relu(x)
+        x = nn.AdaptiveAvgPool2d((1, 1))(x)
+        x = x.view(x.shape[0], -1)
+        return self.classifier(x), self.bb(x)
+
+
+def update_optimizer(optimizer, lr):
+    for i, param_group in enumerate(optimizer.param_groups):
+        param_group["lr"] = lr
+
+
+def train_epocs(model, optimizer, train_dl, val_dl, epochs=10, C=1000):
+    idx = 0
+    for i in range(epochs):
+        model.train()
+        total = 0
+        sum_loss = 0
+        for x, y_class, y_bb in train_dl:
+            batch = y_class.shape[0]
+            x = x.cuda().float()
+            y_class = y_class.cuda()
+            y_bb = y_bb.cuda().float()
+            out_class, out_bb = model(x)
+            loss_class = F.cross_entropy(out_class, y_class, reduction="sum")
+            loss_bb = F.l1_loss(out_bb, y_bb, reduction="none").sum(1)
+            loss_bb = loss_bb.sum()
+            loss = loss_class + loss_bb / C
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            idx += 1
+            total += batch
+            sum_loss += loss.item()
+        train_loss = sum_loss / total
+        val_loss, val_acc = val_metrics(model, valid_dl, C)
+        print("train_loss %.3f val_loss %.3f val_acc %.3f" % (train_loss, val_loss, val_acc))
+    return sum_loss / total
+
+
+def val_metrics(model, valid_dl, C=1000):
+    model.eval()
+    total = 0
+    sum_loss = 0
+    correct = 0
+    for x, y_class, y_bb in valid_dl:
+        batch = y_class.shape[0]
+        x = x.cuda().float()
+        y_class = y_class.cuda()
+        y_bb = y_bb.cuda().float()
+        out_class, out_bb = model(x)
+        loss_class = F.cross_entropy(out_class, y_class, reduction="sum")
+        loss_bb = F.l1_loss(out_bb, y_bb, reduction="none").sum(1)
+        loss_bb = loss_bb.sum()
+        loss = loss_class + loss_bb / C
+        _, pred = torch.max(out_class, 1)
+        correct += pred.eq(y_class).sum().item()
+        sum_loss += loss.item()
+        total += batch
+    return sum_loss / total, correct / total
+
+
+model = BB_model().cuda()
+parameters = filter(lambda p: p.requires_grad, model.parameters())
+optimizer = torch.optim.Adam(parameters, lr=0.006)
+
+train_epocs(model, optimizer, train_dl, valid_dl, epochs=15)
+
+update_optimizer(optimizer, 0.001)
+train_epocs(model, optimizer, train_dl, valid_dl, epochs=10)
